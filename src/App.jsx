@@ -16,11 +16,11 @@ import {
   Sparkles,
   Layers,
   ArrowUpCircle,
+  CheckCircle2,
 } from 'lucide-react';
 import { STAGES, STAGE_COLORS, SALES_REPS, VIRTUALIZATION_CONFIG } from './constants/pipelineConfig';
 import { formatINR, formatDaysAgo } from './utils/formatters';
 import { generateNormalizedDeals } from './utils/dealGenerator';
-import { simulateStageSaveRequest } from './services/mockNetworkService';
 import { useVirtualizer } from './hooks/useVirtualizer';
 import { useTeammateSimulator } from './hooks/useTeammateSimulator';
 import { useKeyboardNavigation } from './hooks/useKeyboardNavigation';
@@ -31,6 +31,10 @@ export default function App() {
   const initialStore = useMemo(() => generateNormalizedDeals(50000), []);
   const [byId, setById] = useState(initialStore.byId);
   const [allIds] = useState(initialStore.allIds);
+
+  // Synchronous Ref Assignment (eliminates stale closures immediately when sliders/deals change)
+  const byIdRef = useRef(byId);
+  byIdRef.current = byId;
 
   // 2. Filter & Preset Workflow State ("I don't know which deals to work on today")
   const [workflowPreset, setWorkflowPreset] = useState('ALL'); // 'ALL' | 'TODAY_PRIORITY' | 'QUARTER_END_STALE'
@@ -54,6 +58,11 @@ export default function App() {
     teammateIntervalMs: 2800,
     teammateSyncEnabled: true,
   });
+
+  // Synchronous Ref Assignment for Chaos Config (ensures slider changes apply instantly without deselecting)
+  const chaosConfigRef = useRef(chaosConfig);
+  chaosConfigRef.current = chaosConfig;
+
   const [toasts, setToasts] = useState([]);
 
   const scrollContainerRef = useRef(null);
@@ -61,12 +70,13 @@ export default function App() {
 
   // Recompute filtered/sorted view ONLY when the user explicitly changes filters/presets
   const computeFilteredIds = useCallback(() => {
+    const currentById = byIdRef.current;
     const q = searchQuery.trim().toLowerCase();
     const matched = [];
 
     for (let i = 0; i < allIds.length; i++) {
       const id = allIds[i];
-      const d = byId[id];
+      const d = currentById[id];
       if (!d) continue;
 
       if (workflowPreset === 'TODAY_PRIORITY') {
@@ -84,11 +94,11 @@ export default function App() {
     }
 
     if (workflowPreset === 'TODAY_PRIORITY') {
-      matched.sort((a, b) => byId[b].priorityScore - byId[a].priorityScore);
+      matched.sort((a, b) => currentById[b].priorityScore - currentById[a].priorityScore);
     }
 
     return matched;
-  }, [allIds, byId, workflowPreset, stageFilter, ownerFilter, searchQuery]);
+  }, [allIds, workflowPreset, stageFilter, ownerFilter, searchQuery]);
 
   // Apply filter changes initiated by the user
   useEffect(() => {
@@ -99,7 +109,7 @@ export default function App() {
     if (scrollContainerRef.current) {
       scrollContainerRef.current.scrollTop = 0;
     }
-  }, [workflowPreset, stageFilter, ownerFilter, searchQuery]);
+  }, [workflowPreset, stageFilter, ownerFilter, searchQuery, computeFilteredIds]);
 
   // Virtualizer Hook
   const {
@@ -142,72 +152,147 @@ export default function App() {
     onRemoteDealMutated: handleRemoteDealMutated,
   });
 
-  // Optimistic Mutation & Automatic Rollback Engine
-  const moveDealsOptimistically = useCallback(
-    async (dealIds, targetStage) => {
-      if (!dealIds || dealIds.length === 0) return;
+  // Optimistic Mutation & Automatic Rollback Engine (Supports Single & Bulk Partial Rollbacks)
+  const moveDealsOptimistically = useCallback(async (dealIds, targetStage) => {
+    if (!dealIds || dealIds.length === 0) return;
 
-      // 1. Capture Snapshot of Prior Stages for Atomic Rollback
-      const previousStageSnapshot = {};
-      setById((prev) => {
-        const next = { ...prev };
-        for (const id of dealIds) {
-          if (next[id]) {
-            previousStageSnapshot[id] = next[id].stage;
-            next[id] = {
-              ...next[id],
-              stage: targetStage,
-              syncStatus: 'saving',
-              errorMessage: null,
-            };
-          }
-        }
-        return next;
-      });
+    const currentById = byIdRef.current;
+    const { minLatencyMs, maxLatencyMs, failureRate } = chaosConfigRef.current;
 
-      // 2. Dispatch to Unreliable Network Simulator
-      try {
-        await simulateStageSaveRequest(chaosConfig);
-        setById((prev) => {
-          const next = { ...prev };
-          for (const id of dealIds) {
-            if (next[id]) {
-              next[id] = { ...next[id], syncStatus: 'idle', errorMessage: null };
-            }
-          }
-          return next;
-        });
-      } catch (err) {
-        // 3. Rollback to Snapshot & Notify User with 1-Click Retry
-        setById((prev) => {
-          const next = { ...prev };
-          for (const id of dealIds) {
-            if (next[id] && previousStageSnapshot[id]) {
-              next[id] = {
-                ...next[id],
-                stage: previousStageSnapshot[id],
-                syncStatus: 'error',
-                errorMessage: 'Save failed — reverted',
-              };
-            }
-          }
-          return next;
-        });
-
-        const toastId = `${Date.now()}-${Math.random()}`;
-        const label =
-          dealIds.length === 1
-            ? `${byId[dealIds[0]]?.company || dealIds[0]} failed to move to "${targetStage}". Reverted.`
-            : `Bulk move of ${dealIds.length.toLocaleString()} deals to "${targetStage}" failed. Reverted.`;
-
-        setToasts((prev) => [
-          { id: toastId, message: label, dealIds, targetStage },
-          ...prev.slice(0, 3),
-        ]);
+    // 1. Synchronously capture snapshot of prior stages BEFORE optimistic mutation
+    const previousStageSnapshot = {};
+    for (const id of dealIds) {
+      if (currentById[id]) {
+        previousStageSnapshot[id] = currentById[id].stage;
       }
-    },
-    [chaosConfig, byId]
-  );
+    }
+
+    const firstDeal = currentById[dealIds[0]];
+    const label =
+      dealIds.length === 1
+        ? `${firstDeal?.company || dealIds[0]}`
+        : `${dealIds.length.toLocaleString()} deals`;
+
+    const toastId = `op-${Date.now()}-${Math.random().toString(36).slice(2, 7)}`;
+
+    // 2. Push immediate "Saving..." toast notification
+    setToasts((prev) => [
+      {
+        id: toastId,
+        status: 'saving',
+        message: `Saving ${label} → "${targetStage}" (Failure rate: ${Math.round(failureRate * 100)}%)...`,
+        dealIds,
+        targetStage,
+      },
+      ...prev.slice(0, 4),
+    ]);
+
+    // 3. Optimistically update the rows in the table
+    setById((prev) => {
+      const next = { ...prev };
+      for (const id of dealIds) {
+        if (next[id]) {
+          next[id] = {
+            ...next[id],
+            stage: targetStage,
+            syncStatus: 'saving',
+            errorMessage: null,
+          };
+        }
+      }
+      return next;
+    });
+
+    // 4. Simulate network latency (0.3s - 1.5s)
+    const span = Math.max(0, maxLatencyMs - minLatencyMs);
+    const latency = Math.floor(minLatencyMs + Math.random() * span);
+    await new Promise((resolve) => setTimeout(resolve, latency));
+
+    // Read latest failureRate at the moment response arrives (so even mid-flight slider changes work!)
+    const effectiveFailureRate = chaosConfigRef.current.failureRate;
+
+    // 5. Evaluate outcome:
+    // - For a single deal: fails with probability `effectiveFailureRate`
+    // - For bulk deals: each deal in the batch is evaluated against `effectiveFailureRate`
+    //   (And if effectiveFailureRate > 0 on a bulk move, guarantee at least 1 failure so testing is deterministic)
+    const succeededIds = [];
+    const failedIds = [];
+
+    for (const id of dealIds) {
+      if (Math.random() < effectiveFailureRate) {
+        failedIds.push(id);
+      } else {
+        succeededIds.push(id);
+      }
+    }
+
+    if (dealIds.length > 1 && effectiveFailureRate > 0 && failedIds.length === 0) {
+      // Guarantee deterministic demonstration when failure slider > 0% on bulk operations
+      failedIds.push(succeededIds.pop());
+    }
+
+    // 6. Commit succeeded deals & Rollback failed deals atomically
+    setById((prev) => {
+      const next = { ...prev };
+      for (const id of succeededIds) {
+        if (next[id]) {
+          next[id] = { ...next[id], syncStatus: 'idle', errorMessage: null };
+        }
+      }
+      for (const id of failedIds) {
+        const priorStage = previousStageSnapshot[id];
+        if (next[id] && priorStage !== undefined) {
+          next[id] = {
+            ...next[id],
+            stage: priorStage,
+            syncStatus: 'error',
+            errorMessage: 'Save failed — reverted',
+          };
+        }
+      }
+      return next;
+    });
+
+    if (failedIds.length === 0) {
+      // All succeeded
+      setToasts((prev) =>
+        prev.map((t) =>
+          t.id === toastId
+            ? {
+                ...t,
+                status: 'success',
+                message: `Saved ${label} → "${targetStage}" (${latency}ms)`,
+              }
+            : t
+        )
+      );
+
+      setTimeout(() => {
+        setToasts((prev) => prev.filter((t) => t.id !== toastId));
+      }, 2800);
+    } else {
+      // Single or Partial Bulk Failure -> Notify & provide 1-click Retry for the failed subset!
+      const errorMsg =
+        dealIds.length === 1
+          ? `SAVE FAILED: ${label} → "${targetStage}". Reverted to "${previousStageSnapshot[dealIds[0]]}".`
+          : failedIds.length === dealIds.length
+          ? `BULK SAVE FAILED: All ${failedIds.length.toLocaleString()} deals failed to move to "${targetStage}" and were reverted.`
+          : `PARTIAL FAILURE (${Math.round(effectiveFailureRate * 100)}% rate): ${succeededIds.length.toLocaleString()} saved, ${failedIds.length.toLocaleString()} failed & reverted to prior stages.`;
+
+      setToasts((prev) =>
+        prev.map((t) =>
+          t.id === toastId
+            ? {
+                ...t,
+                status: 'error',
+                message: errorMsg,
+                dealIds: failedIds, // Clicking "Retry Now" retries ONLY the failed deals!
+              }
+            : t
+        )
+      );
+    }
+  }, []);
 
   // Selection Handlers
   const toggleSelectDeal = useCallback((id) => {
@@ -297,33 +382,86 @@ export default function App() {
       {/* Chaos Simulator Controls */}
       <ChaosControlPanel chaosConfig={chaosConfig} setChaosConfig={setChaosConfig} />
 
-      {/* Toast Notifications for Failed Saves */}
-      {toasts.length > 0 && (
+      {/* Top Inline Banner for Failed Saves */}
+      {toasts.some((t) => t.status === 'error') && (
         <div className="mb-4 space-y-2">
+          {toasts
+            .filter((t) => t.status === 'error')
+            .map((t) => (
+              <div
+                key={`banner-${t.id}`}
+                className="flex items-center justify-between bg-rose-950/95 border border-rose-600 text-rose-100 px-4 py-2.5 rounded-xl text-xs shadow-lg"
+              >
+                <div className="flex items-center gap-2 font-medium">
+                  <AlertTriangle className="w-4 h-4 text-rose-400 shrink-0" />
+                  <span>{t.message}</span>
+                </div>
+                <div className="flex items-center gap-2 shrink-0">
+                  <button
+                    onClick={() => {
+                      setToasts((prev) => prev.filter((item) => item.id !== t.id));
+                      moveDealsOptimistically(t.dealIds, t.targetStage);
+                    }}
+                    className="px-3 py-1 bg-rose-600 hover:bg-rose-500 text-white font-semibold rounded-lg cursor-pointer"
+                  >
+                    Retry {t.dealIds.length > 1 ? `${t.dealIds.length.toLocaleString()} Failed` : 'Now'}
+                  </button>
+                  <button
+                    onClick={() => setToasts((prev) => prev.filter((item) => item.id !== t.id))}
+                    className="text-rose-300 hover:text-white px-2 cursor-pointer"
+                  >
+                    Dismiss
+                  </button>
+                </div>
+              </div>
+            ))}
+        </div>
+      )}
+
+      {/* Floating Bottom-Right Toast Notifications */}
+      {toasts.length > 0 && (
+        <div className="fixed bottom-5 right-5 z-50 w-[420px] max-w-[92vw] space-y-2.5 pointer-events-none">
           {toasts.map((t) => (
             <div
               key={t.id}
-              className="flex items-center justify-between bg-rose-950/90 border border-rose-700 text-rose-100 px-4 py-2.5 rounded-lg text-xs shadow-lg"
+              className={`pointer-events-auto flex items-center justify-between px-4 py-3 rounded-xl text-xs shadow-2xl border backdrop-blur-md transition-all ${
+                t.status === 'saving'
+                  ? 'bg-slate-900/95 border-amber-500/70 text-amber-200'
+                  : t.status === 'success'
+                  ? 'bg-emerald-950/95 border-emerald-500/80 text-emerald-100'
+                  : 'bg-rose-950/95 border-rose-500 text-rose-100 ring-2 ring-rose-500/40'
+              }`}
             >
-              <div className="flex items-center gap-2">
-                <AlertTriangle className="w-4 h-4 text-rose-400 shrink-0" />
-                <span>{t.message}</span>
+              <div className="flex items-center gap-2.5 pr-2">
+                {t.status === 'saving' && (
+                  <Loader2 className="w-4 h-4 text-amber-400 animate-spin shrink-0" />
+                )}
+                {t.status === 'success' && (
+                  <CheckCircle2 className="w-4 h-4 text-emerald-400 shrink-0" />
+                )}
+                {t.status === 'error' && (
+                  <AlertTriangle className="w-4 h-4 text-rose-400 shrink-0" />
+                )}
+                <span className="font-medium leading-snug">{t.message}</span>
               </div>
-              <div className="flex items-center gap-2">
-                <button
-                  onClick={() => {
-                    setToasts((prev) => prev.filter((item) => item.id !== t.id));
-                    moveDealsOptimistically(t.dealIds, t.targetStage);
-                  }}
-                  className="px-2.5 py-1 bg-rose-600 hover:bg-rose-500 text-white font-semibold rounded cursor-pointer"
-                >
-                  Retry Now
-                </button>
+
+              <div className="flex items-center gap-1.5 shrink-0">
+                {t.status === 'error' && (
+                  <button
+                    onClick={() => {
+                      setToasts((prev) => prev.filter((item) => item.id !== t.id));
+                      moveDealsOptimistically(t.dealIds, t.targetStage);
+                    }}
+                    className="px-2.5 py-1 bg-rose-600 hover:bg-rose-500 text-white font-semibold rounded-lg cursor-pointer"
+                  >
+                    Retry {t.dealIds.length > 1 ? `(${t.dealIds.length.toLocaleString()})` : ''}
+                  </button>
+                )}
                 <button
                   onClick={() => setToasts((prev) => prev.filter((item) => item.id !== t.id))}
-                  className="text-rose-300 hover:text-white px-2 cursor-pointer"
+                  className="text-slate-400 hover:text-white px-1.5 cursor-pointer"
                 >
-                  Dismiss
+                  ✕
                 </button>
               </div>
             </div>
@@ -331,7 +469,7 @@ export default function App() {
         </div>
       )}
 
-      {/* Workflow Presets ("I don't know which deals to work on today" & Quarter-End Bulk Cleanup) */}
+      {/* Workflow Presets */}
       <div className="flex flex-wrap items-center justify-between gap-3 mb-3">
         <div className="flex flex-wrap items-center gap-2">
           <button
@@ -383,7 +521,10 @@ export default function App() {
 
           <select
             value={stageFilter}
-            onChange={(e) => setStageFilter(e.target.value)}
+            onChange={(e) => {
+              setStageFilter(e.target.value);
+              e.target.blur();
+            }}
             className="bg-slate-900 border border-slate-800 rounded-lg px-2.5 py-1.5 text-xs text-slate-200"
           >
             <option value="ALL">All Stages</option>
@@ -396,7 +537,10 @@ export default function App() {
 
           <select
             value={ownerFilter}
-            onChange={(e) => setOwnerFilter(e.target.value)}
+            onChange={(e) => {
+              setOwnerFilter(e.target.value);
+              e.target.blur();
+            }}
             className="bg-slate-900 border border-slate-800 rounded-lg px-2.5 py-1.5 text-xs text-slate-200"
           >
             <option value="ALL">All 20 Reps</option>
@@ -548,7 +692,9 @@ export default function App() {
                   transform: `translateY(${absoluteRowIndex * VIRTUALIZATION_CONFIG.ROW_HEIGHT}px)`,
                 }}
                 className={`grid grid-cols-12 items-center px-4 border-b border-slate-900 text-xs transition-colors ${
-                  isFocused
+                  deal.syncStatus === 'error'
+                    ? 'bg-rose-950/40 ring-1 ring-inset ring-rose-600/60'
+                    : isFocused
                     ? 'bg-indigo-950/60 ring-1 ring-inset ring-indigo-500'
                     : isSelected
                     ? 'bg-indigo-950/30'
@@ -591,7 +737,11 @@ export default function App() {
                 <div className="col-span-2">
                   <select
                     value={deal.stage}
-                    onChange={(e) => moveDealsOptimistically([id], e.target.value)}
+                    onChange={(e) => {
+                      const nextStage = e.target.value;
+                      e.target.blur();
+                      moveDealsOptimistically([id], nextStage);
+                    }}
                     className={`text-xs px-2 py-1 rounded border font-medium cursor-pointer ${
                       STAGE_COLORS[deal.stage] || 'bg-slate-800 text-slate-200'
                     }`}
@@ -607,15 +757,15 @@ export default function App() {
                 {/* Sync & Teammate Status */}
                 <div className="col-span-2 flex items-center justify-end gap-1.5">
                   {deal.syncStatus === 'saving' && (
-                    <span className="inline-flex items-center gap-1 text-amber-400 text-[11px]">
-                      <Loader2 className="w-3.5 h-3.5 animate-spin" />
+                    <span className="inline-flex items-center gap-1 px-2 py-0.5 rounded-full bg-amber-950/90 border border-amber-700 text-amber-300 text-[11px] font-medium">
+                      <Loader2 className="w-3 h-3 animate-spin" />
                       Saving...
                     </span>
                   )}
                   {deal.syncStatus === 'error' && (
-                    <span className="inline-flex items-center gap-1 text-rose-400 text-[11px]">
-                      <AlertTriangle className="w-3.5 h-3.5" />
-                      Reverted
+                    <span className="inline-flex items-center gap-1 px-2 py-0.5 rounded-full bg-rose-950 border border-rose-600 text-rose-300 text-[11px] font-semibold">
+                      <AlertTriangle className="w-3 h-3" />
+                      Failed (Reverted)
                     </span>
                   )}
                   {deal.syncStatus === 'idle' && deal.remoteTeammateNote && (

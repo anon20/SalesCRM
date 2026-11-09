@@ -17,22 +17,25 @@ export function ChaosControlPanel({ chaosConfig, setChaosConfig }) {
         </div>
 
         <div className="flex flex-wrap items-center gap-6 text-xs">
-          {/* Failure Rate Slider */}
+          {/* Failure Rate Slider (0% to 100%) */}
           <label className="flex items-center gap-2 text-slate-300">
             <WifiOff className="w-3.5 h-3.5 text-rose-400" />
             <span>Save Failure Rate:</span>
             <input
               type="range"
               min="0"
-              max="50"
+              max="100"
               step="5"
               value={Math.round(chaosConfig.failureRate * 100)}
-              onChange={(e) =>
-                setChaosConfig((c) => ({ ...c, failureRate: Number(e.target.value) / 100 }))
-              }
-              className="w-24 accent-rose-500 cursor-pointer"
+              onChange={(e) => {
+                const nextRate = Number(e.target.value) / 100;
+                setChaosConfig((c) => ({ ...c, failureRate: nextRate }));
+              }}
+              onMouseUp={(e) => e.currentTarget.blur()}
+              onKeyUp={(e) => e.currentTarget.blur()}
+              className="w-28 accent-rose-500 cursor-pointer"
             />
-            <span className="font-mono font-bold text-rose-400 w-9">
+            <span className="font-mono font-bold text-rose-400 w-10">
               {Math.round(chaosConfig.failureRate * 100)}%
             </span>
           </label>
@@ -47,9 +50,12 @@ export function ChaosControlPanel({ chaosConfig, setChaosConfig }) {
               max="2500"
               step="100"
               value={chaosConfig.maxLatencyMs}
-              onChange={(e) =>
-                setChaosConfig((c) => ({ ...c, maxLatencyMs: Number(e.target.value) }))
-              }
+              onChange={(e) => {
+                const nextMax = Number(e.target.value);
+                setChaosConfig((c) => ({ ...c, maxLatencyMs: nextMax }));
+              }}
+              onMouseUp={(e) => e.currentTarget.blur()}
+              onKeyUp={(e) => e.currentTarget.blur()}
               className="w-24 accent-indigo-500 cursor-pointer"
             />
             <span className="font-mono text-indigo-300">
@@ -62,9 +68,11 @@ export function ChaosControlPanel({ chaosConfig, setChaosConfig }) {
             <input
               type="checkbox"
               checked={chaosConfig.teammateSyncEnabled}
-              onChange={(e) =>
-                setChaosConfig((c) => ({ ...c, teammateSyncEnabled: e.target.checked }))
-              }
+              onChange={(e) => {
+                const checked = e.target.checked;
+                setChaosConfig((c) => ({ ...c, teammateSyncEnabled: checked }));
+                e.target.blur();
+              }}
               className="rounded accent-emerald-500"
             />
             <Users className="w-3.5 h-3.5 text-emerald-400" />
